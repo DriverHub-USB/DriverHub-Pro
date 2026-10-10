@@ -1,0 +1,2118 @@
+﻿/*
+This file is part of Snappy Driver Installer.
+
+Snappy Driver Installer is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License or (at your option) any later version.
+
+Snappy Driver Installer is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+Snappy Driver Installer.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#ifdef USE_TORRENT
+
+#ifdef _MSC_VER
+#pragma warning(push)
+// warning C4996: X: was declared deprecated
+#pragma warning( disable : 4996 )
+#endif
+
+#include <windows.h>
+#include <CommCtrl.h>
+#include <direct.h> // for _mkdir and _getcwd
+#include <iostream>
+
+#include "libtorrent/torrent_info.hpp"
+#include "libtorrent/session.hpp"
+#include "libtorrent/alert_types.hpp"
+
+#include "resource.h"
+#include "msapi_utf8.h"
+#include "theme.h"
+#include "draw.h"
+
+#include "logging.h"
+#include "string_utils.hpp"
+#include "Version.h"
+#include "Settings.h"
+#include "gui.h"
+#include "SDI.h"
+#include "system.h"
+#include "matcher.h"
+#include "Update.h"
+#include "manager.h"
+#include "Flags.h"
+#include "install.h"
+
+using namespace lt;
+
+#define SMOOTHING_FACTOR 0.005
+
+Flags* gCli = nullptr;
+
+using namespace libtorrent;
+
+// TorrentStatus
+class TorrentStatus_t
+{
+		long long downloaded,downloadsize;
+		long long uploaded;
+		__int64 elapsed,remaining;
+
+		int status_strid;
+		wchar_t error[12];
+		int uploadspeed,downloadspeed;
+		int seedstotal,seedsconnected;
+		int peerstotal,peersconnected;
+		int wasted,wastedhashfailes;
+
+		bool sessionpaused;
+
+		friend class UpdaterImp;
+};
+
+// UpdateDialog
+class UpdateDialog_t
+{
+		static const int cxn[];
+		static WNDPROC wpOrigButtonProc;
+		static int bMouseInWindow;
+		static HWND hUpdate;
+		int totalsize;
+		int totalavail;
+
+private:
+		static int  getnewver(const char *ptr);
+		static int  getcurver(const char *ptr);
+		void calctotalsize();
+		void calcavailablespace();
+		void updateTexts() const;
+		static void updateButtons();
+
+		static void setCheckboxes();
+		static void setPriorities();
+		static LRESULT CALLBACK NewButtonProc(HWND hWnd,UINT uMsg,WPARAM wParam,LPARAM lParam);
+		static BOOL CALLBACK UpdateProcedure(HWND hwnd,UINT Message,WPARAM wParam,LPARAM lParam);
+
+public:
+		int  populate(int flags,bool clearlist=false);
+		static void setFilePriority(const wchar_t *name,download_priority_t pri);
+		static void openDialog();
+		long LocalRevision;
+		long TorrentRevision;
+};
+
+// Updater
+class UpdaterImp:public Updater_t
+{
+		static Event *downloadmangar_event;
+		static Thread *thandle_download;
+
+		static int downloadmangar_exitflag;
+		static bool finishedupdating;
+		static bool finisheddownloading;
+		static bool movingfiles;
+		static bool closingsession;
+		static bool seed_mode;
+
+		int averageSpeed=0;
+		long long torrenttime=0;
+
+private:
+    const char* active_torrent_url =nullptr;
+		std::wstring const* active_torrent_save_path;
+		char save_path[MAX_PATH];
+		int downloadTorrent();
+		void updateTorrentStatus();
+		static void removeOldDriverpacks(const wchar_t *ptr);
+		void moveNewFiles() const;
+		static unsigned int __stdcall thread_download(void *arg);
+
+public:
+		UpdaterImp();
+		~UpdaterImp();
+
+		void ShowProgress(wchar_t *buf);
+		void ShowPopup(Canvas &canvas);
+
+		void checkUpdates();
+		void resumeDownloading();
+		void pause();
+
+		bool isTorrentReady();
+		bool isPaused();
+		bool isUpdateCompleted();
+		bool isSeedingDrivers();
+
+		int  Populate(int flags);
+		void SetFilePriority(const wchar_t *name, download_priority_t pri);
+		void set_torrent_params();
+		void OpenDialog();
+
+		void DownloadAll();
+		void DownloadNetwork();
+		void DownloadIndices();
+		void StartSeedingDrivers();
+		void StopSeedingDrivers();
+
+		int scriptInitUpdates(int torrentport);
+		int scriptDownloadApp();
+		int scriptDownloadIndices();
+		int scriptDownloadDrivers(std::wstring mode);
+		int scriptDownloadEverything();
+		int scriptDoDownload();
+		int scriptInstall();
+};
+Updater_t *CreateUpdater(){return new UpdaterImp;}
+
+//{ Global variables
+std::shared_ptr<lt::session> ses;
+add_torrent_params p;
+
+torrent_handle gH;
+lt::storage_mode_t allocation_mode = lt::storage_mode_sparse;
+
+
+UpdateDialog_t UpdateDialog;
+Updater_t *Updater;
+TorrentStatus_t TorrentStatus;
+int ListViewSortColumn=666;
+bool ListViewSortAsc=TRUE;
+
+enum DOWNLOAD_STATUS
+{
+		DOWNLOAD_STATUS_WAITING,
+		DOWNLOAD_STATUS_DOWLOADING_TORRENT,
+		DOWNLOAD_STATUS_TORRENT_GOT,
+		DOWNLOAD_STATUS_DOWLOADING_DATA,
+		DOWNLOAD_STATUS_FINISHED_DOWNLOADING,
+		DOWNLOAD_STATUS_PAUSING,
+		DOWNLOAD_STATUS_STOPPING,
+};
+
+// UpdateDialog (static)
+const int UpdateDialog_t::cxn[]={199,60,44,70,70,119};
+HWND UpdateDialog_t::hUpdate=nullptr;
+WNDPROC UpdateDialog_t::wpOrigButtonProc;
+int UpdateDialog_t::bMouseInWindow=0;
+
+// Updater (static)
+const char* Updater_t::torrent_url = "http://driveroff.net/SDI_Update.torrent";
+const char* Updater_t::torrent2_url = "http://driveroff.net/Drivers.torrent";
+const std::wstring Updater_t::torrent_save_path=L"update";
+const std::wstring Updater_t::torrent2_save_path=L"update\\SDI_RUS";
+int Updater_t::activetorrent=1;
+int Updater_t::port=50171;
+int Updater_t::uplimit=0;
+int Updater_t::downlimit=0;
+int Updater_t::connections=50;
+int UpdaterImp::downloadmangar_exitflag;
+bool UpdaterImp::finishedupdating;
+bool UpdaterImp::finisheddownloading;
+bool UpdaterImp::movingfiles;
+bool UpdaterImp::closingsession;
+bool UpdaterImp::seed_mode=false;
+Event *UpdaterImp::downloadmangar_event=nullptr;
+Thread *UpdaterImp::thandle_download=nullptr;
+//}
+
+//{ ListView
+class ListView_t
+{
+public:
+		HWND hListg;
+
+		void init(HWND hwnd)
+		{
+				hListg=GetDlgItem(hwnd,IDLIST);
+				SendMessage(hListg,LVM_SETEXTENDEDLISTVIEWSTYLE,0,LVS_EX_CHECKBOXES|LVS_EX_FULLROWSELECT);
+		}
+		void close()
+		{
+				// free ItemData
+				LVITEM item;
+				type_item *ItemData;
+				for(int i=0;i<GetItemCount();i++)
+				{
+						item.iItem=i;
+						item.mask=LVIF_PARAM;
+						GetItem(&item);
+						ItemData=(type_item*)item.lParam;
+						delete ItemData;
+				}
+				hListg=nullptr;
+		}
+		bool IsVisible() const { return hListg!=nullptr; }
+		void DisableRedraw(bool clearlist) const
+		{
+				if(hListg)
+				{
+						SendMessage(hListg,WM_SETREDRAW,0,0);
+						if(clearlist)SendMessage(hListg,LVM_DELETEALLITEMS,0,0L);
+				}
+		}
+		static LPARAM CALLBACK CompareFunc(LPARAM lParam1,LPARAM lParam2,LPARAM lParamSort)
+		{
+				// the first two parameters are the ItemData structures to be compared
+				// use the third parameter to control which column is used and
+				//  is it sorted ascending or descending
+				// -1 -2 -3 sort descending,  1 2 3 sort ascending
+
+				const bool isAsc = lParamSort > 0;
+				const int column = abs(lParamSort)-1;
+
+				const auto ItemData1=(type_item*)lParam1;
+				const auto ItemData2=(type_item*)lParam2;
+				int nRet=0;
+
+				// default
+				if(column==666)
+				{
+						if(ItemData1->DefaultSort>ItemData2->DefaultSort)nRet=1;
+						else if(ItemData1->DefaultSort<ItemData2->DefaultSort)nRet=-1;
+				}
+				// item name
+				else if(column==0)
+						nRet=wcscmp(ItemData1->ItemName,ItemData2->ItemName);
+				// size
+				else if(column==1)
+				{
+						if(ItemData1->SizeMB>ItemData2->SizeMB)nRet=1;
+						else if(ItemData2->SizeMB>ItemData1->SizeMB)nRet=-1;
+				}
+				// percent
+				else if(column==2)
+				{
+						if(ItemData1->Percent>ItemData2->Percent)nRet=1;
+						else if(ItemData2->Percent>ItemData1->Percent)nRet=-1;
+				}
+				// new ver
+				else if(column==3)
+				{
+						if(ItemData1->VersionNew>ItemData2->VersionNew)nRet=1;
+						else if(ItemData2->VersionNew>ItemData1->VersionNew)nRet=-1;
+				}
+				// current ver
+				else if(column==4)
+				{
+						if(ItemData1->VersionCurrent>ItemData2->VersionCurrent)nRet=1;
+						else if(ItemData2->VersionCurrent>ItemData1->VersionCurrent)nRet=-1;
+				}
+				// for this pc
+				if(column==5)
+						nRet=wcscmp(ItemData1->ForThisPC,ItemData2->ForThisPC);
+				if(!isAsc)nRet=nRet*-1;
+				return nRet;
+		}
+		void EnableRedraw() const
+		{
+				if(hListg)
+				{
+						SendMessage(hListg,LVM_SORTITEMS,667,(LPARAM)CompareFunc);
+						SendMessage(hListg,WM_SETREDRAW,1,0);
+				}
+		}
+
+		int GetItemCount() const
+		{
+				return ListView_GetItemCount(hListg);
+		}
+		int GetCheckState(int i) const
+		{
+				return ListView_GetCheckState(hListg,i);
+		}
+		void SetCheckState(int i,int val) const
+		{
+				ListView_SetCheckState(hListg,i,val);
+		}
+		void SetItemState(int i,UINT32 state,UINT32 mask) const
+		{
+				ListView_SetItemState(hListg,i,state,mask);
+		}
+		void GetItemText(int i,int sub,wchar_t *buf,int sz) const
+		{
+				ListView_GetItemText(hListg,i,sub,buf,sz);
+		}
+		int InsertItem(const LVITEM *lvI) const
+		{
+				return ListView_InsertItem(hListg,lvI);
+		}
+		void GetItem(LVITEM *item) const
+		{
+				SendMessage(hListg,LVM_GETITEM,0,(LPARAM)item);
+		}
+		void InsertColumn(int i,const LVCOLUMN *lvc) const
+		{
+				SendMessage(hListg,LVM_INSERTCOLUMN,i,reinterpret_cast<LPARAM>(lvc));
+		}
+		void SetColumn(int i,const LVCOLUMN *lvc) const
+		{
+				SendMessage(hListg,LVM_SETCOLUMN,i,reinterpret_cast<LPARAM>(lvc));
+		}
+		void SetItemTextUpdate(int iItem,int iSubItem,const wchar_t *str) const
+		{
+			const auto BUFLEN = 256;
+				wchar_t buf[BUFLEN];
+
+				*buf=0;
+				ListView_GetItemText(hListg,iItem,iSubItem,buf,BUFLEN);
+				if(wcscmp(str,buf)!=0)
+						ListView_SetItemText(hListg,iItem,iSubItem,const_cast<wchar_t *>(str));
+		}
+};
+ListView_t ListView;
+
+//}
+
+//{ UpdateDialog
+int UpdateDialog_t::getnewver(const char *s)
+{
+		while(*s)
+		{
+				if(*s=='_'&&s[1]>='0'&&s[1]<='9')
+						return atoi(s+1);
+
+				s++;
+		}
+		return 0;
+}
+
+int UpdateDialog_t::getcurver(const char *ptr)
+{
+		WStringShort bffw;
+
+		bffw.sprintf(L"%S",ptr);
+		wchar_t *s=bffw.GetV();
+		while(*s)
+		{
+				if(*s=='_'&&s[1]>='0'&&s[1]<='9')
+				{
+						*s=0;
+						s=const_cast<wchar_t *>(manager_g->matcher->finddrp(bffw.Get()));
+						if(!s)return 0;
+						while(*s)
+						{
+								if(*s==L'_'&&s[1]>=L'0'&&s[1]<=L'9')
+										return wtoi_my(s+1);
+
+								s++;
+						}
+						return 0;
+				}
+				s++;
+		}
+		return 0;
+}
+
+//static bool yes1(libtorrent::torrent_status const&){return true;}
+
+void UpdateDialog_t::calctotalsize()
+{
+		totalsize=0;
+		for(int i=0;i<ListView.GetItemCount();i++)
+		if(ListView.GetCheckState(i))
+		{
+				wchar_t buf[32];
+				ListView.GetItemText(i,1,buf,32);
+				totalsize+=wtoi_my(buf);
+		}
+}
+
+void UpdateDialog_t::calcavailablespace()
+{
+		// calculate available space on the download drive
+		// for now this is the same as the exe path
+		ULARGE_INTEGER lpFreeBytesAvailable;
+		totalavail=0;
+		if(GetDiskFreeSpaceEx(nullptr,
+													&lpFreeBytesAvailable,
+													nullptr,
+													nullptr))totalavail=lpFreeBytesAvailable.QuadPart>>20;
+}
+
+void UpdateDialog_t::updateTexts() const
+{
+		if(!hUpdate)return;
+
+		// Buttons
+		SetWindowText(hUpdate,STR(STR_UPD_TITLE));
+		SetWindowText(GetDlgItem(hUpdate,IDSELECTION),STR(STR_UPD_SELECTION));
+		SetWindowText(GetDlgItem(hUpdate,IDOPTIONS),STR(STR_UPD_OPTIONS));
+		SetWindowText(GetDlgItem(hUpdate,IDONLYUPDATE),STR(STR_UPD_ONLYUPDATES));
+		SetWindowText(GetDlgItem(hUpdate,IDPREALLOCATE),STR(STR_UPD_PREALLOCATE));
+		SetWindowText(GetDlgItem(hUpdate,IDCHECKALL),STR(STR_UPD_BTN_ALL));
+		SetWindowText(GetDlgItem(hUpdate,IDUNCHECKALL),STR(STR_UPD_BTN_NONE));
+		SetWindowText(GetDlgItem(hUpdate,IDCHECKNETWORK),STR(STR_UPD_BTN_NETWORK));
+		SetWindowText(GetDlgItem(hUpdate,IDCHECKTHISPC),STR(STR_UPD_BTN_THISPC));
+		SetWindowText(GetDlgItem(hUpdate,IDOK),STR(STR_UPD_BTN_OK));
+		SetWindowText(GetDlgItem(hUpdate,IDCANCEL),STR(STR_UPD_BTN_CANCEL));
+		SetWindowText(GetDlgItem(hUpdate,IDACCEPT),STR(STR_UPD_BTN_ACCEPT));
+
+		// Total size and available space
+		WStringShort buf;
+		buf.sprintf(STR(STR_UPD_TOTALSIZE),totalsize);
+		SetWindowText(GetDlgItem(hUpdate,IDTOTALSIZE),buf.Get());
+		buf.sprintf(STR(STR_UPD_TOTALAVAIL),totalavail);
+		SetWindowText(GetDlgItem(hUpdate,IDTOTALAVAIL),buf.Get());
+
+		updateButtons();
+
+		// Column headers
+		LVCOLUMN lvc;
+		lvc.mask=LVCF_TEXT;
+		for(int i=0;i<6;i++)
+		{
+				lvc.pszText=const_cast<wchar_t *>(STR(STR_UPD_COL_NAME+i));
+				ListView.SetColumn(i,&lvc);
+		}
+}
+
+void UpdateDialog_t::updateButtons()
+{
+		// disable buttons if not enough space
+		const bool avail=UpdateDialog.totalsize<UpdateDialog.totalavail;
+		EnableWindow(GetDlgItem(hUpdate, IDOK),avail);
+
+		EnableWindow(GetDlgItem(hUpdate, IDACCEPT),avail);
+}
+
+void UpdateDialog_t::setCheckboxes()
+{
+		if(Updater->isPaused())return;
+		using namespace lt;
+
+		// The app and indices
+		int baseChecked=0,indicesChecked=0;
+		const std::shared_ptr<const lt::torrent_info> ti = gH.torrent_file();
+		for(lt::file_index_t i(0); i < file_index_t(ti->num_files()); ++i)
+		if(gH.file_priority(i) == low_priority)
+		{
+				if(StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"indexes\\"))
+						indicesChecked=1;
+				else
+						baseChecked=1;
+		}
+
+		// Driverpacks
+        for (file_index_t i(0); static_cast<int>(i) < ListView.GetItemCount(); i++)
+        {
+            LVITEM item;
+            item.mask = LVIF_PARAM;
+            item.iItem = static_cast<int>(i);
+            ListView.GetItem(&item);
+            int val = 0;
+            const auto ItemData = (type_item*)item.lParam;
+
+            if (ItemData->DefaultSort == -2)val = baseChecked;
+            if (ItemData->DefaultSort == -1)val = indicesChecked;
+            // Set file mark in list according to file download priority
+            if (ItemData->DefaultSort >= 0) val = gH.file_priority(file_index_t{ ItemData->DefaultSort }).operator uint8_t();
+
+				ListView.SetCheckState(static_cast<int>(i),val);
+		}
+}
+
+void UpdateDialog_t::setPriorities()
+{
+		// set the torrent priorities based on the list items checkboxes
+
+		// Clear priorities for driverpacks
+		for(file_index_t i(0); static_cast<int>(i) < Updater->numfiles; i++)
+		if(StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"drivers\\"))
+				gH.file_priority(i,dont_download);
+
+
+		// Set priorities for driverpacks
+		download_priority_t base_pri=dont_download, indices_pri=dont_download;
+		for(int i=0;i<ListView.GetItemCount();i++)
+		{
+				// get each list view item
+				LVITEM item;
+				item.mask=LVIF_PARAM;
+				item.iItem=i;
+				ListView.GetItem(&item);
+				// get the item check state
+				const int val=ListView.GetCheckState(i);
+
+				const auto ItemData=(type_item*)item.lParam;
+				// app priority will be 2 if checked
+				if(ItemData->DefaultSort==-2)base_pri=val? default_priority :dont_download;
+				// index priority will be 2 if checked
+				if(ItemData->DefaultSort==-1)indices_pri=val? default_priority : dont_download;
+				// driver priority will be 1 if checked
+				if(ItemData->DefaultSort >= 0)
+                    gH.file_priority(static_cast<file_index_t>(ItemData->DefaultSort),low_priority);
+		}
+
+		// Set priorities for any torrent file that's not a driver
+		for(lt::file_index_t i(0); static_cast<int>(i) <Updater->numfiles; ++i)
+		if(!StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"drivers\\"))
+				gH.file_priority(i,StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"indexes\\")?indices_pri:base_pri);
+}
+
+LRESULT CALLBACK UpdateDialog_t::NewButtonProc(HWND hWnd,UINT uMsg,WPARAM wParam,LPARAM lParam)
+{
+		short x,y;
+
+		x=LOWORD(lParam);
+		y=HIWORD(lParam);
+
+		switch(uMsg)
+		{
+				case WM_MOUSEMOVE:
+						Popup->drawpopup(0,STR_UPD_BTN_THISPC_H,FLOATING_TOOLTIP,x,y,hWnd);
+						ShowWindow(Popup->hPopup,SW_SHOWNOACTIVATE);
+						if(!bMouseInWindow)
+						{
+								bMouseInWindow=1;
+								TRACKMOUSEEVENT tme;
+								tme.cbSize=sizeof(tme);
+								tme.dwFlags=TME_LEAVE;
+								tme.hwndTrack=hWnd;
+								TrackMouseEvent(&tme);
+						}
+						break;
+
+				case WM_MOUSELEAVE:
+						bMouseInWindow=0;
+						Popup->drawpopup(0,0,FLOATING_NONE,0,0,hWnd);
+						break;
+
+				default:
+						return CallWindowProc(wpOrigButtonProc,hWnd,uMsg,wParam,lParam);
+		}
+		return true;
+}
+
+BOOL CALLBACK UpdateDialog_t::UpdateProcedure(HWND hwnd,UINT Message,WPARAM wParam,LPARAM lParam)
+{
+		LVCOLUMN lvc;
+		HWND thispcbut,chk1,chk2;
+		wchar_t buf[32];
+		int i;
+
+		thispcbut=GetDlgItem(hwnd,IDCHECKTHISPC);
+		chk1=GetDlgItem(hwnd,IDONLYUPDATE);
+		chk2=GetDlgItem(hwnd,IDPREALLOCATE);
+
+		switch(Message)
+		{
+				case WM_INITDIALOG:
+						setMirroring(hwnd);
+						ListView.init(hwnd);
+						lvc.mask=LVCF_FMT|LVCF_WIDTH|LVCF_SUBITEM|LVCF_TEXT;
+						lvc.pszText=const_cast<wchar_t *>(L"");
+						for(i=0;i<6;i++)
+						{
+								lvc.cx=cxn[i];
+								lvc.iSubItem=i;
+								lvc.fmt=i?LVCFMT_RIGHT:LVCFMT_LEFT;
+								ListView.InsertColumn(i,&lvc);
+						}
+
+						hUpdate=hwnd;
+						UpdateDialog.populate(0,true);
+						UpdateDialog.updateTexts();
+						UpdateDialog_t::setCheckboxes();
+						if(Settings.flags&FLAG_ONLYUPDATES)SendMessage(chk1,BM_SETCHECK,BST_CHECKED,0);
+						if(allocation_mode == storage_mode_allocate)SendMessage(chk2,BM_SETCHECK,BST_CHECKED,0);
+
+						wpOrigButtonProc=(WNDPROC)SetWindowLongPtr(thispcbut,GWLP_WNDPROC,(LONG_PTR)NewButtonProc);
+						SetTimer(hwnd,1,2000,nullptr);
+
+						if(Settings.flags&FLAG_AUTOUPDATE)SendMessage(hwnd,WM_COMMAND,IDCHECKALL,0);
+						return TRUE;
+
+				case WM_NOTIFY:
+						{
+								const auto lpnmh = (LPNMHDR)lParam;
+								if(lpnmh->code==LVN_ITEMCHANGED)
+								{
+										UpdateDialog.calctotalsize();
+										UpdateDialog.calcavailablespace();
+										UpdateDialog.updateTexts();
+										return TRUE;
+								}
+								// column sort
+								if(lpnmh->code==LVN_COLUMNCLICK)
+										if(lpnmh->idFrom==IDLIST)
+										{
+												const auto pListView = (NMLISTVIEW*)lParam;
+												if(pListView->iSubItem==ListViewSortColumn)
+														ListViewSortAsc=!ListViewSortAsc;
+												else
+												{
+														ListViewSortColumn=pListView->iSubItem;
+														ListViewSortAsc=TRUE;
+												}
+												LPARAM lParamSort=ListViewSortColumn+1;
+												if(!ListViewSortAsc)lParamSort=-lParamSort;
+												SendMessage(ListView.hListg,LVM_SORTITEMS,lParamSort,(LPARAM)
+												            ListView_t::CompareFunc);
+												return TRUE;
+										}
+								break;
+						}
+
+				case WM_DESTROY:
+						SetWindowLongPtr(thispcbut,GWLP_WNDPROC,(LONG_PTR)wpOrigButtonProc);
+						ListView.close();
+						break;
+
+				case WM_TIMER:
+						if(ses && ses->is_paused() == 0)UpdateDialog.populate(1);
+						uprintfs(".");
+						break;
+
+				case WM_COMMAND:
+						switch(LOWORD(wParam))
+						{
+								case IDOK:
+										hUpdate=nullptr;
+										UpdateDialog_t::setPriorities();
+										Settings.flags&=~FLAG_ONLYUPDATES;
+										if(SendMessage(chk1,BM_GETCHECK,0,0))Settings.flags|=FLAG_ONLYUPDATES;
+										//Settings.flags&=~FLAG_KEEPSEEDING;
+										if(SendMessage(chk2,BM_GETCHECK,0,0))allocation_mode = storage_mode_allocate;
+										Updater->resumeDownloading();
+										EndDialog(hwnd,IDOK);
+										return TRUE;
+
+								case IDACCEPT:
+									UpdateDialog_t::setPriorities();
+										Settings.flags&=~FLAG_ONLYUPDATES;
+										if(SendMessage(chk1,BM_GETCHECK,0,0))Settings.flags|=FLAG_ONLYUPDATES;
+										//Settings.flags&=~FLAG_KEEPSEEDING;
+										if (SendMessage(chk2, BM_GETCHECK, 0, 0))allocation_mode = storage_mode_allocate;
+										Updater->resumeDownloading();
+										if(Settings.flags&FLAG_KEEPSEEDING)
+												EndDialog(hwnd,IDOK);
+										return TRUE;
+
+								case IDCANCEL:
+										hUpdate=nullptr;
+										EndDialog(hwnd,IDCANCEL);
+										return TRUE;
+
+								case IDONLYUPDATE:
+										Settings.flags&=~FLAG_ONLYUPDATES;
+										if(SendMessage(chk1,BM_GETCHECK,0,0))Settings.flags|=FLAG_ONLYUPDATES;
+										UpdateDialog.populate(0,true);
+										break;
+
+								case IDPREALLOCATE:
+									UpdateDialog_t::updateButtons();
+										return TRUE;
+
+								case IDCHECKALL:
+								case IDUNCHECKALL:
+										for(i=0;i<ListView.GetItemCount();i++)
+												ListView.SetCheckState(i,LOWORD(wParam)==IDCHECKALL?1:0);
+										if(Settings.flags&FLAG_AUTOUPDATE)
+										{
+												Settings.flags&=~FLAG_AUTOUPDATE;
+												SendMessage(hwnd,WM_COMMAND,IDOK,0);
+										}
+										return TRUE;
+
+								case IDCHECKTHISPC:
+										for(i=0;i<ListView.GetItemCount();i++)
+										{
+												*buf=0;
+												ListView.GetItemText(i,5,buf,32);
+												ListView.SetCheckState(i,StrStrIW(buf,STR(STR_UPD_YES))?1:0);
+										}
+										return TRUE;
+
+								case IDCHECKNETWORK:
+										for(i=0;i<ListView.GetItemCount();i++)
+										{
+												*buf=0;
+												ListView.GetItemText(i,0,buf,32);
+												const bool chk=StrStrIW(buf,L"_LAN_")||StrStrIW(buf,L"_WLAN-WiFi_")||StrStrIW(buf,L"_WWAN-4G_");
+												ListView.SetCheckState(i,chk);
+										}
+								default:
+									break;
+						}
+						break;
+
+				case WM_CTLCOLORSTATIC:
+						{
+								// if not enough space to download turn label red
+								const bool avail=UpdateDialog.totalsize<UpdateDialog.totalavail;
+								if((HWND)lParam==GetDlgItem(hUpdate,IDTOTALAVAIL)&&!avail)
+								{
+										const auto hdcStatic=(HDC)wParam;
+										SetTextColor(hdcStatic, RGB(255,0,0));
+										SetBkColor(hdcStatic, GetSysColor(COLOR_BTNFACE));
+										return (LRESULT)GetStockObject(HOLLOW_BRUSH);
+								}
+								else return TRUE;
+						}
+						break;
+
+				default:
+						break;
+		}
+		return FALSE;
+}
+
+int UpdateDialog_t::populate(int update,bool clearlist)
+{
+		wchar_t buf[MAX_PATH];
+		int ret=0;
+		LocalRevision=0;
+		TorrentRevision=0;
+
+		// Read torrent info
+		if(!gH.is_valid())return 0;
+		std::vector<std::int64_t> file_progress;
+		gH.file_progress(file_progress);
+		Updater->numfiles=0;
+
+		const std::shared_ptr<const lt::torrent_info> ti = gH.torrent_file();
+		if (!ti) return 0;
+		Updater->numfiles=ti->num_files();
+
+		// Calculate size and progress for the app and indices
+		bool missingIndices=false;
+		int newver=0;
+		__int64 basesize=0,basedownloaded=0;
+		__int64 indexsize=0,indexdownloaded=0;
+		lt::file_storage const& fs = ti->files();
+		for (auto const i : fs.file_range())
+		{
+					int const idx = static_cast<int>(i);
+
+				// the file name minus the parent directory 'SDI_Update'
+				    auto const fullpath=fs.file_path(i);
+                    auto const filenamefull = strchr(fullpath.c_str(), '\\')+1;
+                    OutputDebugStringA(filenamefull);
+
+				// looking for missing "_" online indices
+				if(StrStrIA(filenamefull,"indexes\\"))
+				{
+						indexsize+= fs.file_size(i);
+						indexdownloaded+=file_progress[idx];
+						wsprintf(buf,L"%S",filenamefull);
+						*wcsstr(buf,L"DP_")=L'_';
+						strsub(buf,L"indexes\\SDI",Settings.index_dir);
+						if (!SystemImp::FileExists(buf))
+						{
+								missingIndices = true;
+								//struct _wfinddata_t index_file;
+								//intptr_t hFile;
+								//// Find old index file
+								//if ((hFile = _wfindfirst(buf, &index_file)) == -1L)
+								//		printf("No old index\n");
+
+						}
+				}
+				else if(!StrStrIA(filenamefull,"drivers\\"))
+				{
+						basesize+=fs.file_size(i);
+						basedownloaded+=file_progress[idx];
+						if(StrStrIA(filenamefull,"sdi"))
+								TorrentRevision=atol(StrStrIA(filenamefull,"sdi")+3);
+				}
+		}
+
+		// Disable redrawing of the list
+		ListView.DisableRedraw(clearlist);
+
+		// Setup LVITEM
+		LVITEM lvI;
+		lvI.mask      =LVIF_TEXT|LVIF_STATE|LVIF_PARAM;
+		lvI.stateMask =0;
+		lvI.iSubItem  =0;
+		lvI.state     =0;
+		lvI.iItem     =0;
+
+		int row=0;
+		//LocalRevision=System.FindLatestExeVersion();
+//if(TorrentRevision>0)TorrentRevision=700;  // test
+		// only return the torrent exe version if it's newer than what i have
+		if(TorrentRevision>LocalRevision)ret+=TorrentRevision<<8;
+		// the application entry
+		if(TorrentRevision>LocalRevision&&ListView.IsVisible())
+		{
+				// the data item
+				auto ItemData=new type_item;
+				lvI.lParam=(LPARAM)ItemData;
+				ItemData->DefaultSort=-2;
+				wcscpy(ItemData->ItemName,STR(STR_UPD_APP));
+				ItemData->SizeMB=basesize/1024/1024;
+				ItemData->Percent=basedownloaded*100/basesize;
+				ItemData->VersionNew=TorrentRevision;
+				ItemData->VersionCurrent=LocalRevision;
+				wcscpy(ItemData->ForThisPC,STR(STR_UPD_YES));
+				// the list item
+				lvI.pszText=const_cast<wchar_t *>(STR(STR_UPD_APP));
+				if(!update)row=ListView.InsertItem(&lvI);
+				wsprintf(buf,L"%d %s",(int)(basesize/1024/1024),STR(STR_UPD_MB));
+				ListView.SetItemTextUpdate(row,1,buf);
+				wsprintf(buf,L"%d%%",(int)(basedownloaded*100/basesize));
+				ListView.SetItemTextUpdate(row,2,buf);
+				wsprintf(buf,L" SDI%d",TorrentRevision);
+				ListView.SetItemTextUpdate(row,3,buf);
+				wsprintf(buf,L" SDI%d",LocalRevision);
+				ListView.SetItemTextUpdate(row,4,buf);
+				ListView.SetItemTextUpdate(row,5,STR(STR_UPD_YES));
+				row++;
+		}
+
+		// Add indices to the list
+		if(missingIndices&&ListView.IsVisible())
+		{
+				// the data item
+				auto ItemData=new type_item;
+				lvI.lParam=(LPARAM)ItemData;
+				ItemData->DefaultSort=-1;
+				wcscpy(ItemData->ItemName,STR(STR_UPD_INDICES));
+				ItemData->SizeMB=indexsize/1024/1024;
+				ItemData->Percent=indexdownloaded*100/indexsize;
+				ItemData->VersionNew=0;
+				ItemData->VersionCurrent=0;
+				wcscpy(ItemData->ForThisPC,STR(STR_UPD_YES));
+				// the list item
+				lvI.pszText=const_cast<wchar_t *>(STR(STR_UPD_INDICES));
+				if(!update)row=ListView.InsertItem(&lvI);
+				wsprintf(buf,L"%d %s",(int)(indexsize/1024/1024),STR(STR_UPD_MB));
+				ListView.SetItemTextUpdate(row,1,buf);
+				wsprintf(buf,L"%d%%",(int)(indexdownloaded*100/indexsize));
+				ListView.SetItemTextUpdate(row,2,buf);
+				ListView.SetItemTextUpdate(row,5,STR(STR_UPD_YES));
+				row++;
+		}
+
+		// Add driverpacks to the list
+		for(auto const i : fs.file_range())
+		{
+				int const idx = static_cast<int>(i);
+
+				auto const fullpath=fs.file_path(i);
+                auto const filenamefull = strchr(fullpath.c_str(), '\\') + 1;
+                auto const filename = fs.file_name(i).data();
+
+				if(StrStrIA(filenamefull,".7z"))
+				{
+						int oldver;
+
+						wsprintf(buf,L"%S",filename);
+						lvI.pszText=buf;
+						int sz=(int)(fs.file_size(i)/1024/1024);
+						if(!sz)sz=1;
+
+						newver=getnewver(filenamefull);
+						oldver=getcurver(filename);
+
+						// if this flag is set, only get new versions of packs we already have
+						if(Settings.flags&FLAG_ONLYUPDATES)
+								{if(newver>oldver&&oldver)ret++;else continue;}
+						else
+								if(newver>oldver)ret++;
+
+						if(newver>oldver&&ListView.IsVisible())
+						{
+								// the data item
+								auto ItemData=new type_item;
+								lvI.lParam=(LPARAM)ItemData;
+								ItemData->DefaultSort = idx;
+								wcscpy(ItemData->ItemName,buf);
+								ItemData->SizeMB=sz;
+								ItemData->Percent=file_progress[idx]*100/ti->files().file_size(i);
+								ItemData->VersionNew=newver;
+								ItemData->VersionCurrent=oldver;
+								wcscpy(ItemData->ForThisPC,STR(STR_UPD_YES+manager_g->manager_drplive(buf)));
+								// the list item
+								if(!update)row=ListView.InsertItem(&lvI);
+								wsprintf(buf,L"%d %s",sz,STR(STR_UPD_MB));
+								ListView.SetItemTextUpdate(row,1,buf);
+								wsprintf(buf,L"%d%%",(int)(file_progress[idx]*100/ti->files().file_size(i)));
+								ListView.SetItemTextUpdate(row,2,buf);
+								wsprintf(buf,L"%d",newver);
+								ListView.SetItemTextUpdate(row,3,buf);
+								wsprintf(buf,L"%d",oldver);
+								if(!oldver)wsprintf(buf,L"%ws",STR(STR_UPD_MISSING));
+								ListView.SetItemTextUpdate(row,4,buf);
+								wsprintf(buf,L"%S",filename);
+								wsprintf(buf,L"%ws",STR(STR_UPD_YES+manager_g->manager_drplive(buf)));
+								ListView.SetItemTextUpdate(row,5,buf);
+								row++;
+						}
+				}
+		}
+
+		// Enable redrawing of the list
+		ListView.EnableRedraw();
+
+		// preselect the first item in the list
+		ListView.SetItemState(0,LVIS_FOCUSED|LVIS_SELECTED,LVIS_FOCUSED|LVIS_SELECTED);
+
+		if(update)return ret;
+
+		if(ret)manager_g->itembar_settext(SLOT_NODRIVERS,0);
+		manager_g->itembar_settext(SLOT_DOWNLOAD,ret?1:0,nullptr,ret,0,0);
+
+		bool showBOOSTY=ret?1:0;
+		if(emptydrp)showBOOSTY=false;
+		if(Settings.flags&FLAG_HIDEBOOSTY)showBOOSTY=false;
+		manager_g->itembar_settext(SLOT_BOOSTY,showBOOSTY,nullptr,ret,0,0);
+		return ret;
+}
+
+void UpdateDialog_t::setFilePriority(const wchar_t *name,download_priority_t pri)
+{
+		char buf[MAX_PATH];
+		wsprintfA(buf,"%S",name);
+
+		for(lt::file_index_t i(0); static_cast<int>(i) <Updater->numfiles; ++i)
+		if(StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),buf))
+		{
+				gH.file_priority(i,pri);
+				uprintf("Req(%S,%d)\n",name,pri);
+		}
+}
+
+void UpdateDialog_t::openDialog()
+{
+		DialogBox(hMainInstance,MAKEINTRESOURCE(IDD_DIALOG2),MainWindow.hMain,UpdateProcedure);
+}
+//}
+
+//{ Updater
+void UpdaterImp::updateTorrentStatus()
+{
+		const lt::torrent_status st=gH.status();
+	TorrentStatus_t *t=&TorrentStatus;
+
+		memset(t,0,sizeof(TorrentStatus_t));
+		//if(!st)
+		//{
+		//    wcscpy(t->error,STR(STR_DWN_ERRSES));
+		//    return;
+		//}
+		//ses->get_torrent_status(&temp, &yes1, 0);
+
+		//if(temp.empty())
+		//{
+		//    wcscpy(t->error,STR(STR_DWN_ERRTOR));
+		//    return;
+		//}
+		//lt::torrent_status& st=temp[0];
+
+		t->elapsed=13;
+
+		wcscpy(t->error,L"");
+
+		t->downloadspeed=st.download_payload_rate;
+		t->uploadspeed=st.upload_payload_rate;
+
+		t->seedstotal=st.list_seeds;
+		t->peerstotal=st.list_peers;
+		t->seedsconnected=st.num_seeds;
+		t->peersconnected=st.num_peers;
+
+		t->wasted=int(st.total_redundant_bytes);
+		t->wastedhashfailes=int(st.total_failed_bytes);
+
+		t->downloadsize=st.total_wanted;
+		t->downloaded=st.total_wanted_done;
+		t->uploaded=st.total_payload_upload;
+
+		if(torrenttime)t->elapsed= SystemImp::GetTickCountWr()-torrenttime;
+		if(t->downloadspeed)
+		{
+				averageSpeed=static_cast<int>(SMOOTHING_FACTOR*t->downloadspeed+(1-SMOOTHING_FACTOR)*averageSpeed);
+				if(averageSpeed)t->remaining=(t->downloadsize-t->downloaded)/averageSpeed*1000;
+		}
+
+		// fs.state is the enumerated type of the current state of the torrent
+		// "There is only a distinction between finished and seeding if some pieces
+		//  or files have been set to priority 0, i.e. are not downloaded."
+
+		// if the session is shut down then clear the stats
+		if(ses->is_paused())
+		{
+				*t={};
+				t->status_strid=STR_TR_ST4;
+		}
+		// if torrent is seeding
+		else if(st.state==lt::torrent_status::finished&&seed_mode)
+				t->status_strid=STR_TR_ST5;
+		// if we're moving the downloaded files
+		else if(movingfiles)
+				t->status_strid=STR_TR_ST8;
+		// other torrent states
+		else if (st.flags == torrent_flags::paused)
+				t->status_strid=STR_TR_ST0;
+		else if(st.state==lt::torrent_status::checking_files)
+				t->status_strid=STR_TR_ST1;
+		else if(st.state==lt::torrent_status::downloading_metadata)
+				t->status_strid=STR_TR_ST2;
+		else if(st.state==lt::torrent_status::downloading)
+				t->status_strid=STR_TR_ST3;
+		else if(st.state==lt::torrent_status::finished)
+				t->status_strid=STR_TR_ST4;
+		else if(st.state==lt::torrent_status::seeding)
+				t->status_strid=STR_TR_ST5;
+		//else if(st.state==lt::torrent_status::allocating)
+		//		t->status_strid=STR_TR_ST6;
+		else if(st.state==lt::torrent_status::checking_resume_data)
+				t->status_strid=STR_TR_ST7;
+
+		t->sessionpaused=ses->is_valid();
+
+		if(TorrentStatus.downloadsize)
+				manager_g->itembar_settext(SLOT_DOWNLOAD,1,nullptr,-1,-1,TorrentStatus.downloaded*1000/TorrentStatus.downloadsize);
+		MainWindow.redrawfield();
+}
+
+void UpdaterImp::removeOldDriverpacks(const wchar_t *ptr)
+{
+		WStringShort bffw;
+		bffw.append(ptr);
+		wchar_t *s=bffw.GetV();
+		while(*s)
+		{
+				if(*s=='_'&&s[1]>='0'&&s[1]<='9')
+				{
+						*s=0;
+						s=const_cast<wchar_t *>(manager_g->matcher->finddrp(bffw.Get()));
+						if(!s)return;
+						WStringShort buf;
+						buf.sprintf(L"%ws\\%s",Settings.drp_dir,s);
+						uprintf("Old file: %S\n",buf.Get());
+						_wremove(buf.Get());
+						return;
+				}
+				s++;
+		}
+}
+
+void UpdaterImp::moveNewFiles() const
+{
+		file_index_t i(0);
+
+		const auto ti=gH.torrent_file();
+		monitor_pause=1;
+
+		// Delete old "_" online indices if new are downloaded
+		for(i; static_cast<int>(i)<numfiles; ++i)
+				if(gH.file_priority(i)!=dont_download&&
+					 StrStrIA(ti->files().file_path(i).c_str(),"indexes"))
+						break;
+		if(i!=file_index_t(ti->num_files()))
+		{
+				WStringShort buf;
+				buf.sprintf(L"/c del %ws\\_*.bin",Settings.index_dir);
+				SystemImp::run_command(L"cmd",buf.Get(),SW_HIDE,1);
+		}
+
+		for (file_index_t const i : ti->files().file_range())
+				if(gH.file_priority(i)!=dont_download)
+				{
+						std::string filenamefull= ti->files().file_path(i);
+						if(activetorrent==1)
+								filenamefull=strchr(filenamefull.c_str(),'\\')+1;
+						// Skip autorun.inf and del_old_driverpacks.bat
+						if(StrStrIA(filenamefull.c_str(),"autorun.inf")||StrStrIA(filenamefull.c_str(),".bat"))continue;
+
+						wchar_t filenamefull_src[MAX_PATH];
+						wsprintf(filenamefull_src,L"%s\\%S", active_torrent_save_path->c_str(), ti->files().file_path(i).c_str());
+
+						// Determine destination dirs
+						wchar_t filenamefull_dst[MAX_PATH];
+						wsprintf(filenamefull_dst,L"%S",filenamefull.c_str());
+						strsub(filenamefull_dst,L"indexes\\SDI",Settings.index_dir);
+						strsub(filenamefull_dst,L"drivers",Settings.drp_dir);
+						strsub(filenamefull_dst,L"tools\\SDI",Settings.data_dir);
+
+						// Delete old driverpacks
+						if(StrStrIA(filenamefull.c_str(),"drivers\\"))
+								removeOldDriverpacks(filenamefull_dst+8);
+
+						// Prepare "_" online indices
+						wchar_t *p=filenamefull_dst;
+						if(p)
+						{
+								while(wcschr(p,L'\\'))p=wcschr(p,L'\\')+1;
+								if(StrStrIW(filenamefull_src,L"indexes\\"))*p=L'_';
+
+								// Create dirs for the file
+								WStringShort dirs;
+								dirs.append(filenamefull_dst);
+								p=dirs.GetV();
+								while(wcschr(p,L'\\'))p=wcschr(p,L'\\')+1;
+								if(p[-1]==L'\\')
+								{
+										*--p=0;
+										mkdir_r(dirs.Get());
+								}
+				}
+
+				// can't move a file to a different drive
+				// instead do a copy/delete
+
+				// get current working drive
+				wchar_t* buffer;
+				int cwdDrive=-1;
+				if ( (buffer = _wgetcwd(nullptr,MAX_PATH) ) == nullptr)
+						uprintfs("_wgetcwd error");
+				else
+						cwdDrive = SystemImp::DriveNumber(buffer);
+
+				// find the source  drive
+				int srcDrive = SystemImp::DriveNumber(filenamefull_src);
+				if (srcDrive==-1) srcDrive=cwdDrive;
+				uprintf("Src: %d %S\n",srcDrive,filenamefull_src);
+				// find the destination drive
+				int destDrive = SystemImp::DriveNumber(filenamefull_dst);
+				if ( wcscspn(filenamefull_dst,L"\\\\")!=0 && destDrive==-1 ) destDrive=cwdDrive;
+				uprintf("Dst: %d %S\n",destDrive,filenamefull_dst);
+
+				// if source and destination drive are the same then perform a move
+				if (srcDrive==destDrive)
+				{
+						// Move file
+						uprintf("Move new file: %S\n",filenamefull_dst);
+						if(!MoveFileEx(filenamefull_src,filenamefull_dst,MOVEFILE_REPLACE_EXISTING||MOVEFILE_COPY_ALLOWED||MOVEFILE_WRITE_THROUGH))
+							uprintf("  Could not rename %s to %s: %s", filenamefull_src, filenamefull_dst, WindowsErrorString());
+				}
+				// if not perform a copy / delete
+				else
+				{
+						uprintf("Copy new file: %S\n",filenamefull_dst);
+                        if (!CopyFileExW(filenamefull_src, filenamefull_dst, nullptr, nullptr, nullptr, 0))
+							uprintf("Failed to copy file: %s", WindowsErrorString());
+						else if(SystemImp::FileExists(filenamefull_dst))
+	                        SystemImp::deletefile(filenamefull_src);
+				}
+	}
+		SystemImp::run_command(L"cmd",L" /c rd /s /q update",SW_HIDE,1);
+}
+
+void UpdaterImp::checkUpdates()
+{
+		if(!SystemImp::canWriteDirectory(L"update"))
+		{
+				uprintfs("ERROR in checkUpdates(): Write-protected,'update'\n");
+				return;
+		}
+
+		downloadmangar_exitflag=DOWNLOAD_STATUS_DOWLOADING_TORRENT;
+		downloadmangar_event->raise();
+}
+
+void UpdaterImp::ShowProgress(wchar_t *buf)
+{
+		// updates the text on the updates button
+
+		using namespace libtorrent;
+		namespace lt = libtorrent;
+
+		if(ses)
+		{
+			const auto BUFLEN = 128;
+			wchar_t num1[BUFLEN],num2[BUFLEN],num3[BUFLEN],num4[BUFLEN];
+				format_size(num1,TorrentStatus.downloaded,0);
+				format_size(num2,TorrentStatus.downloadsize,0);
+				format_size(num3,TorrentStatus.uploadspeed,1);
+				format_size(num4,TorrentStatus.uploaded,0);
+
+				//std::vector<torrent_status> temp;
+				//ses->get_torrent_status(&temp,&yes1,0);
+				//if(temp.empty())return;
+				const torrent_status st=gH.status();
+				if (st.errc) return;
+				if(closingsession)
+						wsprintf(buf,STR(STR_DWN_CLOSING));
+				else if(movingfiles)
+						wsprintf(buf,STR(STR_TR_ST8));
+				else if(st.flags & torrent_flags::paused &&
+						st.flags & lt::torrent_flags::auto_managed)
+						wsprintf(buf,STR(STR_TR_ST0));
+				else if(st.state==torrent_status::checking_files)
+						wsprintf(buf,STR(STR_UPD_CHECKINGFILES),num1,num2,
+								TorrentStatus.downloadsize?TorrentStatus.downloaded*100/TorrentStatus.downloadsize:0);
+				else if(st.state==torrent_status::downloading_metadata)
+						wsprintf(buf,STR(STR_TR_ST2));
+				else if(st.state==torrent_status::downloading)
+						wsprintf(buf,STR(STR_UPD_PROGRES),num1,num2,
+								TorrentStatus.downloadsize?TorrentStatus.downloaded*100/TorrentStatus.downloadsize:0);
+				//else if(!(st.flags & lt::torrent_flags::paused)									 //torrent seeds by default
+				//				&& st.state == lt::torrent_status::seeding							 //so "Updates are available:" will be replaced
+				//				|| st.state == lt::torrent_status::finished)						 //by "Seeding %s (%s)" message
+				//				wsprintf(buf,STR(STR_DWN_SEEDING),num3,num4);
+				//else if(st.state==torrent_status::finished)
+				//		wsprintf(buf,STR(STR_TR_ST4));
+				else if(st.state==torrent_status::seeding)
+						wsprintf(buf,STR(STR_DWN_SEEDING),num3,num4);
+				//else if(st.state==torrent_status::allocating)			//deprecated
+				//		wsprintf(buf,STR(STR_TR_ST6));							 //This is typically
+																													// completed in a fraction of a second
+				else if(st.state==torrent_status::checking_resume_data)
+						wsprintf(buf,STR(STR_TR_ST7));
+		}
+}
+
+void UpdaterImp::ShowPopup(Canvas &canvas)
+{
+		textdata_vert td(canvas);
+		TorrentStatus_t t;
+		int p0=D_X(POPUP_OFSX),p1=D_X(POPUP_OFSX)+10;
+		long long per=0;
+		const auto BUFLEN = 128;
+		wchar_t num1[BUFLEN],num2[BUFLEN];
+
+		td.y=D_X(POPUP_OFSY);
+
+		//update_getstatus(&t);
+		t=TorrentStatus;
+
+		format_size(num1,t.downloaded,0);
+		format_size(num2,t.downloadsize,0);
+		if(t.downloadsize)per=t.downloaded*100/t.downloadsize;
+		td.TextOutSF(STR(STR_DWN_DOWNLOADED),STR(STR_DWN_DOWNLOADED_F),num1,num2,per);
+		format_size(num1,t.uploaded,0);
+		td.TextOutSF(STR(STR_DWN_UPLOADED),num1);
+		format_time(num1,t.elapsed);
+		td.TextOutSF(STR(STR_DWN_ELAPSED),num1);
+		format_time(num1,t.remaining);
+		td.TextOutSF(STR(STR_DWN_REMAINING),num1);
+
+		td.nl();
+		if(t.status_strid)
+				td.TextOutSF(STR(STR_DWN_STATUS),L"%s",STR(t.status_strid));
+		if(*t.error)
+		{
+				td.col=D_C(POPUP_CMP_INVALID_COLOR);
+				td.TextOutSF(STR(STR_DWN_ERROR),L"%s",t.error);
+				td.col=D_C(POPUP_TEXT_COLOR);
+		}
+		format_size(num1,t.downloadspeed,1);
+		td.TextOutSF(STR(STR_DWN_DOWNLOADSPEED),num1);
+		format_size(num1,t.uploadspeed,1);
+		td.TextOutSF(STR(STR_DWN_UPLOADSPEED),num1);
+
+		td.nl();
+		td.TextOutSF(STR(STR_DWN_SEEDS),STR(STR_DWN_SEEDS_F),t.seedsconnected,t.seedstotal);
+		td.TextOutSF(STR(STR_DWN_PEERS),STR(STR_DWN_SEEDS_F),t.peersconnected,t.peerstotal);
+		format_size(num1,t.wasted,0);
+		format_size(num2,t.wastedhashfailes,0);
+		td.TextOutSF(STR(STR_DWN_WASTED),STR(STR_DWN_WASTED_F),num1,num2);
+
+//    TextOutSF(&td,L"Paused",L"%d,%d",t.sessionpaused,t.torrentpaused);
+		Popup->popup_resize(td.getMaxsz()+POPUP_SYSINFO_OFS+p0+p1,td.y+D_X(POPUP_OFSY));
+}
+
+UpdaterImp::UpdaterImp()
+{
+		//seed_mode=false;
+		closingsession=false;
+		TorrentStatus.sessionpaused=1;
+		downloadmangar_exitflag=DOWNLOAD_STATUS_WAITING;
+
+		switch(activetorrent)
+		{
+				case 1:
+						active_torrent_url=torrent_url;
+						active_torrent_save_path=&torrent_save_path;
+						break;
+				case 2:
+						active_torrent_url=torrent2_url;
+						active_torrent_save_path=&torrent2_save_path;
+						break;
+				default:
+						break;
+		}
+
+		downloadmangar_event=CreateEventWr(true);
+
+		installupdate_exitflag=0;
+		installupdate_event=CreateEventWr(true);
+
+		thandle_download = new Thread();
+		thandle_download->start(&thread_download,nullptr);
+}
+
+UpdaterImp::~UpdaterImp()
+{
+		if(thandle_download)
+		{
+				downloadmangar_exitflag=DOWNLOAD_STATUS_STOPPING;
+				downloadmangar_event->raise();
+				thandle_download->join();
+				delete thandle_download;
+				delete downloadmangar_event;
+		}
+}
+
+static __inline BOOL is_WOW64(void)
+{
+	BOOL ret = FALSE;
+	IsWow64Process(GetCurrentProcess(), &ret);
+	return ret;
+}
+
+int UpdaterImp::downloadTorrent() try
+{
+	char default_agent[64];
+	// checking for updates
+		manager_g->itembar_settext(SLOT_DOWNLOAD,1,STR(STR_UPD_CHECKING),0,0,0);
+
+		//Timers.start(time_chkupdate);
+
+		// Connecting
+   	lt::error_code ec;
+        //ses->listen_on(std::make_pair(port,port),ec);
+    lt::settings_pack mSettingsPack;
+		mSettingsPack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:port,[::]:port)");
+
+  //      if(ec)uprintf("ERROR: failed to open listen socket: %s\n",ec.message().c_str());
+		//log("Listen port: %d (%s)\nDownload limit: %dKb\nUpload limit: %dKb\n",
+		//			ses->listen_port(),ses->is_listening()?"connected":"disconnected",
+		//			downlimit,uplimit);
+		// Settings
+		mSettingsPack.set_int(settings_pack::choking_algorithm, settings_pack::rate_based_choker);
+
+		static_sprintf(default_agent, APPLICATION_NAME "/%d.%d.%d (Windows NT %lu.%lu%s)",
+			VERSION_FILEVERSION_NUM,
+			WindowsVersion.Major, WindowsVersion.Minor, is_WOW64() ? "; WOW64" : "");
+		mSettingsPack.set_str(lt::settings_pack::user_agent, default_agent);
+		mSettingsPack.set_int(settings_pack::alert_mask
+		, lt::alert_category::error
+		//| lt::alert_category::peer
+		//| lt::alert_category::port_mapping
+		| lt::alert_category::storage
+		| lt::alert_category::tracker
+		| lt::alert_category::connect
+		| lt::alert_category::status
+		/*| lt::alert_category::ip_block
+		| lt::alert_category::performance_warning
+		| lt::alert_category::dht
+		| lt::alert_category::incoming_request
+		*///| lt::alert_category::dht_operation
+		/*| lt::alert_category::port_mapping_log
+		*/| lt::alert_category::file_progress);
+    ses.reset(new lt::session(mSettingsPack));
+
+		wcstombs(save_path, active_torrent_save_path->c_str(), BUFSIZ);
+        // download the torrent file to feed to the libtorrent
+        uprintf("Starting to download '%s'\n", active_torrent_url);
+        const bool ok = DownloadToFileOrBufferEx(active_torrent_url, save_path, default_agent, nullptr, hMainDialog, FALSE);
+        uprintf("HttpGetToFile(): ok=%d, downloaded to '%s'\n", (int)ok, save_path);
+
+		p.save_path = save_path;
+		p.storage_mode = allocation_mode;
+    p.flags |= torrent_flags::paused;
+        // make sure all file priorities are set to 0, except the ones
+        // we specify in the file_priorities
+    p.flags |= torrent_flags::default_dont_download;
+        //atp.flags &= ~torrent_flags::auto_managed;
+		set_torrent_params();
+
+		gH = ses->add_torrent(p, ec);
+
+
+        for (;;) {
+            std::vector<lt::alert*> alerts;
+            ses->pop_alerts(&alerts);
+
+            for (lt::alert const* a : alerts) {
+                std::cout << a->message() << std::endl;
+                // if we receive the finished alert or an error, we're done
+                if (auto at = lt::alert_cast<lt::add_torrent_alert>(a)) {
+                    goto done;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    done:
+        std::cout << "done, pausing torrent" << std::endl;
+        ses->pause();
+
+        if (ec)uprintf("ERROR: failed to add torrent: %s\n", ec.message().c_str());
+
+//set_torrent_params();
+//gH.resume();
+
+
+		// Download torrent
+		uprintfs("Waiting for torrent handle");
+
+		for(int i=0;i<200;i++)
+		{
+				uprintfs(".");
+				// test if torrent has been retrieved
+				if(gH.torrent_file())
+				{
+						downloadmangar_exitflag=DOWNLOAD_STATUS_TORRENT_GOT;
+						uprintfs("DONE\n");
+						return 0;
+						break;
+				}
+				// test if there was some error condition
+				if(downloadmangar_exitflag!=DOWNLOAD_STATUS_DOWLOADING_TORRENT)break;
+				Sleep(100);
+		}
+
+		if(Settings.flags&FLAG_SCRIPTMODE)
+		{
+				if(!gH.torrent_file())
+						downloadmangar_exitflag=DOWNLOAD_STATUS_STOPPING;
+				return 0;
+		}
+
+	// checking for updates
+	manager_g->itembar_settext(SLOT_DOWNLOAD,0,L"",0,0,0);
+
+		// test if we failed to get the torrent
+	if (!gH.torrent_file())
+	{
+			if (emptydrp) manager_g->itembar_settext(SLOT_NODRIVERS, 1);
+			downloadmangar_exitflag = DOWNLOAD_STATUS_STOPPING;
+			uprintfs("FAILED\n");
+			return 0;
+	}
+	else return 1;
+
+		// Populate list
+		int i=UpdateDialog.populate(0);
+		if(UpdateDialog.TorrentRevision==0)
+				uprintfs("Latest Version: Not found.\n");
+		else if(UpdateDialog.TorrentRevision<=UpdateDialog.LocalRevision)
+				uprintf("Latest Version: R%d. Up to date.\n",UpdateDialog.TorrentRevision);
+		else
+				uprintf("Latest Version: R%d.\n",UpdateDialog.TorrentRevision);
+		uprintf("Updated driver packs available: %d\n",i&0xFF);
+
+		// clear the torrent priorities
+        for (file_index_t j(0); static_cast<int>(j) < numfiles; j++) {
+            gH.file_priority(j, lt::dont_download);
+            gH.file_priority(j);}
+
+		//Timers.stop(time_chkupdate);
+		return i;
+}
+catch (lt::system_error const& e)
+{
+	std::printf("failed to load torrent \"%s\": %s\n"
+		, save_path, e.code().message().c_str());
+	return false;
+}
+
+void UpdaterImp::resumeDownloading()
+{
+		if(!ses || !gH.torrent_file())
+		{
+				finisheddownloading=1;
+				finishedupdating=1;
+				return;
+		}
+		if(ses->is_paused())
+		{
+				gH.force_recheck();
+				uprintfs("torrent_resume\n");
+				downloadmangar_exitflag=DOWNLOAD_STATUS_DOWLOADING_DATA;
+				downloadmangar_event->raise();
+		}
+
+		ses->resume();
+		// sometimes the torrent stays paused
+		gH.resume();
+		finisheddownloading=0;
+		finishedupdating=0;
+		torrenttime= SystemImp::GetTickCountWr();
+}
+
+int UpdaterImp::scriptInitUpdates(int torrentport)
+{
+	Updater_t::port=torrentport;
+		checkUpdates();
+		while(downloadmangar_exitflag==DOWNLOAD_STATUS_DOWLOADING_TORRENT)
+				downloadmangar_event->wait();
+
+		// Read torrent info
+		const std::shared_ptr<const lt::torrent_info> ti = gH.torrent_file();
+		Updater->numfiles=0;
+		if(ti)
+		{
+				Updater->numfiles=ti->num_files();
+				Settings.flags|=FLAG_UPDATESOK;
+				uprintfs("Torrent downloaded successfully\n");
+		}
+		else
+		{
+				uprintfs("Torrent download failed\n");
+				return 1;
+		}
+
+		return downloadmangar_exitflag==DOWNLOAD_STATUS_TORRENT_GOT?0:1;
+}
+
+int UpdaterImp::scriptDownloadApp()
+{
+		if((Settings.flags&FLAG_UPDATESOK)==0)
+		{
+				uprintfs("Error: get : Updates not initialized");
+				return 1;
+		}
+
+		// select everything that's not indices and drivers in the torrent
+		for(lt::file_index_t i(0); static_cast<int>(i) <Updater->numfiles; ++i)
+		{
+				if(!StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"indexes\\")&&
+					 !StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"drivers\\"))
+						gH.file_priority(i,default_priority);
+				else
+						gH.file_priority(i,dont_download);
+		}
+		return scriptDoDownload();
+}
+
+int UpdaterImp::scriptDownloadIndices()
+{
+		if((Settings.flags&FLAG_UPDATESOK)==0)
+		{
+				uprintfs("Error: get : Updates not initialized");
+				return 1;
+		}
+		std::shared_ptr<lt::torrent_info const> ti=gH.torrent_file();
+
+		// select indices in the torrent
+		for(lt::file_index_t i(0); static_cast<int>(i) < Updater->numfiles; ++i)
+		{
+				// get the file entry
+				std::string file= gH.torrent_file()->files().file_path(i);
+				const size_t p=file.find("indexes\\");
+				if(p!=std::string::npos)
+						gH.file_priority(i,default_priority);
+				else
+						gH.file_priority(i,dont_download);
+		}
+		return scriptDoDownload();
+}
+
+int UpdaterImp::scriptDownloadDrivers(std::wstring mode)
+{
+		if((Settings.flags&FLAG_UPDATESOK)==0)
+		{
+				uprintfs("Error: get : Updates not initialized");
+				return 1;
+		}
+		uprintf("%d items selected\n",manager_g->selected());
+
+		const bool all=_wcsicmp(mode.c_str(),L"all")==0;
+		const bool missing=_wcsicmp(mode.c_str(),L"missing")==0;
+		const bool updates=_wcsicmp(mode.c_str(),L"updates")==0;
+		const bool selected=_wcsicmp(mode.c_str(),L"selected")==0;
+
+		// set all active
+		manager_g->filter(126);
+
+		std::shared_ptr<lt::torrent_info const> ti;
+		ti=gH.torrent_file();
+		int updatecount=0;
+
+		// iterate the torrent
+		for(lt::file_index_t const i : ti->files().file_range())
+		{
+				// disable all files by default
+				gH.file_priority(i,dont_download);
+				// get the file entry
+				std::string file = gH.torrent_file()->files().file_path(i);
+				// look for driver entries
+				const size_t p=file.find("drivers\\");
+				if(p!=std::string::npos)
+				{
+						file.erase(0,p+8);
+						const int curver= SystemImp::getcurver(file.c_str());
+						const int newver= SystemImp::getver(file.c_str());
+						bool getfile=false;
+						if(all)
+								getfile=newver>curver;
+						else if(missing)
+								getfile=newver>curver&&!curver;
+						else if(updates)
+								getfile=newver>curver&&curver;
+						else if (selected&&newver>curver)
+						{
+								auto widestr = std::wstring(file.begin(), file.end());
+								getfile=manager_g->isSelected(widestr.c_str()) &&
+												!manager_g->manager_drplive(widestr.c_str()); // 0 = yes
+						}
+						if(getfile)
+						{
+								uprintf("Getting: %s\n", file.c_str());
+								gH.file_priority(i,low_priority);
+								updatecount++;
+						}
+				}
+		}
+
+		if(!updatecount)
+		{
+				uprintfs("Driver packs are up to date, nothing to do\n");
+				return 0;
+		}
+
+		uprintf("Getting %d driver packs\n",updatecount);
+		return scriptDoDownload();
+}
+
+int UpdaterImp::scriptDownloadEverything()
+{
+		if((Settings.flags&FLAG_UPDATESOK)==0)
+		{
+				uprintfs("Error: get : Updates not initialized");
+				return 1;
+		}
+
+		std::shared_ptr<lt::torrent_info const> ti;
+		ti = gH.torrent_file();
+
+		for(lt::file_index_t i(0); static_cast<int>(i) < Updater->numfiles; ++i)
+				gH.file_priority(i,dont_download);
+
+		// select everything but drivers
+		for(lt::file_index_t i(0); static_cast<int>(i) <Updater->numfiles; ++i)
+		{
+				if(!StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"drivers\\"))
+						gH.file_priority(i,default_priority);
+		}
+
+		// missing and updated drivers
+		for(lt::file_index_t i(0); static_cast<int>(i) <Updater->numfiles; ++i)
+		{
+				// get the file entry
+				std::string file=gH.torrent_file()->files().file_path(i).c_str();
+				// look for driver entries
+				const size_t p=file.find("drivers\\");
+				if(p!=std::string::npos)
+				{
+						file.erase(0,p+8);
+						const int curver= SystemImp::getcurver(file.c_str());
+						const int newver= SystemImp::getver(file.c_str());
+						// newer or missing
+						if(newver>curver)
+						{
+								uprintf("Getting: %s\n", file.c_str());
+								gH.file_priority(i,low_priority);
+						}
+				}
+		}
+		return scriptDoDownload();
+}
+
+int UpdaterImp::scriptDoDownload()
+{
+		int count=0;
+		for(lt::file_index_t i(0); static_cast<int>(i) < Updater->numfiles; ++i)
+				if(gH.file_priority(i)!=dont_download)count++;
+		if(!count)return 0;
+		resumeDownloading();
+		while(downloadmangar_exitflag==DOWNLOAD_STATUS_DOWLOADING_DATA)
+				downloadmangar_event->wait();
+		return downloadmangar_exitflag==DOWNLOAD_STATUS_FINISHED_DOWNLOADING?0:1;
+}
+
+int UpdaterImp::scriptInstall()
+{
+		// check if anything selected
+		if(manager_g->selected()==0)
+		{
+				uprintfs("Error: install : Nothing selected.\n");
+				return 1;
+		}
+
+		manager_g->itembar_setactive(SLOT_RESTORE_POINT,0);
+		// switch off all files by default
+		if(Settings.flags&FLAG_UPDATESOK)
+		{
+				for(lt::file_index_t i(0); static_cast<int>(i) < Updater->numfiles; ++i)
+						gH.file_priority(i,dont_download);
+		}
+		Manager::install(INSTALLDRIVERS);
+		installupdate_exitflag=0;
+		while(installupdate_exitflag==0)
+				installupdate_event->wait();
+		return installupdate_exitflag==1?0:1; // 1=success
+}
+
+void UpdaterImp::DownloadAll()
+{
+		for(lt::file_index_t i(0); static_cast<int>(i) < Updater->numfiles; ++i)
+				if(StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"indexes\\"))
+						gH.file_priority(i,default_priority);
+				else
+						gH.file_priority(i,low_priority);
+		Updater->resumeDownloading();
+}
+
+void UpdaterImp::DownloadNetwork()
+{
+		for(lt::file_index_t i(0); static_cast<int>(i) < Updater->numfiles; ++i)
+		{
+				// indices
+				if(StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"indexes\\"))
+						gH.file_priority(i,default_priority);
+				else
+				{
+						// the file name minus the path
+						std::string filename=gH.torrent_file()->files().file_name(i).data();
+						// look for all networking packs
+						const size_t found1=filename.find("_LAN_");
+						const size_t found2=filename.find("_WLAN-WiFi_");
+						const size_t found3=filename.find("_WWAN-4G_");
+						if(found1!=std::string::npos||found2!=std::string::npos||found3!=std::string::npos)
+								gH.file_priority(i,low_priority);
+				}
+		}
+		Updater->resumeDownloading();
+}
+
+void UpdaterImp::DownloadIndices()
+{
+		for(lt::file_index_t i(0); static_cast<int>(i) < Updater->numfiles; ++i)
+				if(StrStrIA(gH.torrent_file()->files().file_path(i).c_str(),"indexes\\"))
+						gH.file_priority(i,default_priority);
+		Updater->resumeDownloading();
+}
+
+void UpdaterImp::StartSeedingDrivers()
+{
+		if(!ses)return;
+
+		// don't interrupt the current session
+		if(!ses->is_paused())
+				return;
+
+		// i'm going to point the torrent files back to
+		// the actual drivers directory rather than the update directory
+		// and enable seeding for whatever files exist there
+		// once it had been done, but it was no good for regular downloading
+
+		wchar_t buf[FILENAME_MAX];
+		buf[0]=0;
+		ses->pause();
+		std::shared_ptr<lt::torrent_info const> ti;
+		ti=gH.torrent_file();
+		if(!ti)return;
+
+		// modify the files in the torrent
+		for(file_index_t i(0); static_cast<int>(i)<ti->num_files(); i++)
+		{
+				// disable all files by default
+				gH.file_priority(i, lt::low_priority);
+				// get the file entry
+				std::string file=ti->files().file_path(i).c_str();
+				const size_t p=file.find("drivers\\");
+				if(p!=std::string::npos)
+				// seed *existing* drivers only
+				{
+						// remove the parent directory 'SDI_Update'
+						file.replace(0,p,"");
+						// prepend the app path
+						file= SystemImp::AppPathS()+"\\"+file;
+						// if the file exists, reset the path in the torrent and enable it
+						MultiByteToWideChar(CP_ACP,MB_PRECOMPOSED,file.c_str(),static_cast<int>(strlen(file.c_str())+1),buf, FILENAME_MAX);
+						if(SystemImp::FileExists2(buf))
+						{
+								gH.rename_file(i,file);
+								gH.file_priority(i,low_priority);
+								uprintf("Seeding: %s\n",file.c_str());
+						}
+				}
+		}
+
+		// restart the torrent
+		seed_mode=true;
+		resumeDownloading();
+
+		// update the system menu text
+		PostMessage(MainWindow.hMain, WM_SEEDING, 0, 1);
+}
+
+void UpdaterImp::StopSeedingDrivers()
+{
+		// switching off seed_mode will trigger MoveFiles which we don't want
+		if(isSeedingDrivers())
+		{
+				// update the button status via ShowProgress
+				closingsession=true;
+				// give the gui time to update
+				// when it's done it will reset the updater via WM_TIMER
+				// why is this not firing the WM_TIMER procedure?
+				SetTimer(MainWindow.hMain,2,500,nullptr);
+				// update the system menu text
+				PostMessage(MainWindow.hMain, WM_SEEDING, 0, 0);
+
+				MainWindow_t::ResetUpdater(Updater_t::activetorrent);
+		}
+}
+
+unsigned int __stdcall UpdaterImp::thread_download(void *arg)
+{
+	UNREFERENCED_PARAMETER(arg);
+
+		// Wait till is allowed to download the torrent
+	uprintfs("{thread_download\n");
+		downloadmangar_event->wait();
+		if(downloadmangar_exitflag!=DOWNLOAD_STATUS_DOWLOADING_TORRENT)
+		{
+				uprintfs("}thread_download(never started)\n");
+				return 0;
+		}
+
+		// Download torrent
+		const auto Updater1=dynamic_cast<UpdaterImp *>(Updater);
+		const int TorrentResults=Updater1->downloadTorrent();
+		if(downloadmangar_exitflag!=DOWNLOAD_STATUS_TORRENT_GOT)
+		{
+				uprintfs("}thread_download(failed to download torrent)\n");
+				return 0;
+		}
+
+		Updater1->updateTorrentStatus();
+		downloadmangar_event->reset();
+
+		// successfully downloaded the torrent
+		// notify main window
+		PostMessage(MainWindow.hMain,WM_TORRENT,0,TorrentResults);
+
+		// when run with /autoupdate parameter and nothing to download
+		// openDialog locks up - possibly invisible modal dialog
+		if(Settings.flags&FLAG_AUTOUPDATE&&TorrentResults==0)
+		{
+				finishedupdating=1;
+				monitor_pause=0;
+				downloadmangar_exitflag=DOWNLOAD_STATUS_STOPPING;
+		}
+
+		while(downloadmangar_exitflag!=DOWNLOAD_STATUS_STOPPING)
+		{
+				// Wait till is allowed to download driverpacks
+				if(Settings.flags&FLAG_AUTOUPDATE&& SystemImp::canWriteDirectory(L"update"))
+					UpdateDialog_t::openDialog();
+				else
+						downloadmangar_event->wait();
+
+				if(downloadmangar_exitflag==DOWNLOAD_STATUS_STOPPING)break;
+
+				// Downloading loop
+				uprintfs("{torrent_starting\n");
+				while(downloadmangar_exitflag==DOWNLOAD_STATUS_DOWLOADING_DATA&&ses)
+				{
+						Sleep(500);
+
+						// Show progress
+						Updater1->updateTorrentStatus();
+						if(!(Settings.flags&FLAG_SCRIPTMODE))
+						{
+								MainWindow.ShowProgressInTaskbar(true,TorrentStatus.downloaded,TorrentStatus.downloadsize);
+								InvalidateRect(Popup->hPopup,nullptr,0);
+						}
+
+						// Send libtorrent messages to log
+						std::vector<lt::alert*> alerts;
+						ses->pop_alerts(&alerts);
+						for (const auto a : alerts)
+						{
+                    if(Log.isAllowed(LOG_VERBOSE_TORRENT))
+								uprintf("Torrent: %s | %s\n", a->what(), a->message().c_str());
+						}
+
+						// process the downloads when finished and not seeding
+						if(TorrentStatus.status_strid==STR_TR_ST0+libtorrent::torrent_status::finished&&!seed_mode)
+						{
+								uprintfs("Torrent: finished\n");
+								ses->pause();
+
+								// Flush cache
+								uprintfs("Torrent: flushing cache...");
+								gH.flush_cache();
+								// synchronize to make sure the files have been created on disk
+								using namespace lt;
+								while(1)
+								{
+										auto const* a=ses->wait_for_alert(seconds(60*2));
+										if(!a)
+										{
+												uprintfs("time out\n");
+												break;
+										}
+										if(alert_cast<cache_flushed_alert>(a))
+										{
+												uprintfs("done\n");
+												break;
+										}
+								}
+
+								// Move files
+								movingfiles=1;
+								Updater1->updateTorrentStatus();
+								Updater1->moveNewFiles();
+								movingfiles=0;
+								Updater1->updateTorrentStatus();
+								gH.force_recheck();
+
+								if(Settings.flags&FLAG_SCRIPTMODE)
+								{
+										downloadmangar_exitflag=DOWNLOAD_STATUS_FINISHED_DOWNLOADING;
+										downloadmangar_event->raise();
+								}
+								else
+								{
+										// Update list
+										UpdateDialog.populate(0,true);
+
+										// Execute user cmd
+										if(*Settings.finish_upd)
+										{
+												WStringShort buf;
+												buf.sprintf(L" /c %s",Settings.finish_upd);
+												SystemImp::run_command(L"cmd",buf.Get(),SW_HIDE,0);
+										}
+										if(Settings.flags&FLAG_AUTOCLOSE&&!(Settings.flags&FLAG_AUTOINSTALL))
+												PostMessage(MainWindow.hMain,WM_CLOSE,0,0);
+
+										downloadmangar_exitflag=DOWNLOAD_STATUS_FINISHED_DOWNLOADING;
+										downloadmangar_event->raise();
+
+										// Flash in taskbar
+										MainWindow.ShowProgressInTaskbar(false);
+										FLASHWINFO fi;
+
+										fi.cbSize=sizeof(FLASHWINFO);
+										fi.hwnd=MainWindow.hMain;
+										// Use FLASHW_ALL to flash the main dialog
+										fi.dwFlags=FLASHW_ALL|FLASHW_TIMERNOFG;
+										fi.uCount=0;
+										fi.dwTimeout=0;
+										if(installmode==MODE_NONE)
+										{
+												FlashWindowEx(&fi);
+												invalidate(INVALIDATE_INDICES|INVALIDATE_MANAGER);
+										}
+								}// else script mode
+						}
+				}
+				// Download is completed
+				finishedupdating=1;
+				ses->pause();
+				Updater1->updateTorrentStatus();
+				monitor_pause=0;
+				uprintfs("}torrent_stop\n");
+				downloadmangar_event->reset();
+		} // !=DOWNLOAD_STATUS_STOPPING
+
+		if(ses)
+		{
+				uprintfs("Closing torrent session...");
+				ses->remove_torrent(gH);
+				ses->pause();
+				ses->abort();
+				uprintfs("DONE\n");
+		}
+		uprintfs("}thread_download\n");
+		return 0;
+}
+
+void UpdaterImp::pause(){downloadmangar_exitflag=DOWNLOAD_STATUS_PAUSING;}
+
+bool UpdaterImp::isTorrentReady(){return gH.torrent_file()!=nullptr;}
+bool UpdaterImp::isPaused(){return TorrentStatus.sessionpaused;}
+bool UpdaterImp::isUpdateCompleted(){return finishedupdating;}
+bool UpdaterImp::isSeedingDrivers(){return seed_mode;}
+int  UpdaterImp::Populate(int flags){return UpdateDialog.populate(flags,!flags);}
+void UpdaterImp::SetFilePriority(const wchar_t *name,download_priority_t pri){ UpdateDialog_t::setFilePriority(name,pri);}
+void UpdaterImp::set_torrent_params()
+{
+	p.max_connections=connections;
+	p.max_uploads = -1;
+	p.upload_limit = uplimit*1024;
+	p.download_limit = downlimit*1024;
+
+	if (seed_mode) p.flags |= lt::torrent_flags::seed_mode;
+	p.save_path = save_path;
+	p.storage_mode = allocation_mode;
+}
+
+void UpdaterImp::OpenDialog(){ UpdateDialog_t::openDialog();}
+//
+//// the assumption is that this is a portable version downloaded to temp directory
+//// we should copy ourselves over the existing file, launch ourselves and
+//// tell our new copy to delete ourselves
+//void UpdateSelfTo(const char* file) {
+//	HANDLE hFile = INVALID_HANDLE_VALUE;
+//
+//	assert(url != NULL);
+//
+//	if (file== NULL) {
+//		uprintf("Could not get save path");
+//		return;
+//	}
+//	hFile = CreateFileU(file, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+//	if (hFile == INVALID_HANDLE_VALUE) {
+//		uprintf("Unable to create file '%s': %s", PathFindFileNameU(file), WindowsErrorString());
+//		return;
+//	}
+//	if (!WriteFile(hFile, buf, buf_len, &ret, NULL)) {
+//		uprintf("Error writing file '%s': %s", PathFindFileNameU(file), WindowsErrorString());
+//		ret = 0;
+//		goto out;
+//	}
+//    TempStr srcPath = GetSelfExePathTemp();
+//    bool ok = file::Copy(file, srcPath, false);
+//    // TODO: maybe retry if copy fails under the theory that the file
+//    // might be temporarily locked
+//    if (!ok) {
+//        uprintf("UpdateSelfTo: failed to copy self to file\n");
+//        return;
+//    }
+//    uprintf("UpdateSelfTo: copied self to file\n");
+//
+//    TempStr args = str::FormatTemp(R"(-sleep-ms 500 -delete-file "%s")", srcPath);
+//    CreateProcessHelper(path, args);
+//out:
+//	error_code = GetLastError();
+//	if (hFile != INVALID_HANDLE_VALUE) {
+//		// Force a flush - May help with the PKI API trying to process downloaded updates too early...
+//		FlushFileBuffers(hFile);
+//		CloseHandle(hFile);
+//	}
+//	if (!r) {
+//		if (file != NULL)
+//			DeleteFileU(file);
+//		if (buffer != NULL)
+//			safe_free(*buffer);
+//	}
+//	if (hRequest)
+//		InternetCloseHandle(hRequest);
+//	if (hConnection)
+//		InternetCloseHandle(hConnection);
+//	if (hSession)
+//		InternetCloseHandle(hSession);
+//
+//	SetLastError(error_code);
+//	return r ? size : 0;
+//}
+
+//}
+#else
+
+#include "update.h"
+
+Updater_t *Updater;
+int Updater_t::port=50171;
+int Updater_t::downlimit=0;
+int Updater_t::uplimit=0;
+int Updater_t::connections=0;
+wchar_t Updater_t::torrent_url[BUFSIZ];
+#endif
